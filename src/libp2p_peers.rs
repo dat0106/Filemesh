@@ -12,7 +12,6 @@ use libp2p::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -27,11 +26,9 @@ const BOOTSTRAP_NODES: [&str; 4] = [
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
 ];
 
-// Danh sách các relay node công khai. Các node này hoạt động như trạm chuyển tiếp
-// để giúp các peer kết nối với nhau khi chúng không thể kết nối trực tiếp (do NAT).
-const RELAY_NODES: [&str; 1] = [
-    "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
-];
+// Danh sách các relay node công khai (chỉ sử dụng TCP).
+const RELAY_NODES: [&str; 1] =
+    ["/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ"];
 
 /// Enum `ConnectionType` biểu diễn trạng thái kết nối của một peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,24 +49,15 @@ impl std::fmt::Display for ConnectionType {
 }
 
 /// `FileMeshBehaviour` kết hợp nhiều `NetworkBehaviour` khác nhau thành một.
-/// Đây là "bộ não" của node mạng, định nghĩa cách nó hành xử.
 #[derive(NetworkBehaviour)]
 pub struct FileMeshBehaviour {
-    // `gossipsub`: Để lan truyền tin nhắn trong mạng (pub/sub).
     pub gossipsub: gossipsub::Behaviour,
-    // `mdns`: Để khám phá các peer khác trong cùng mạng cục bộ.
     pub mdns: mdns::tokio::Behaviour,
-    // `identify`: Để xác định thông tin của các peer khác (địa chỉ, giao thức).
     pub identify: identify::Behaviour,
-    // `ping`: Để kiểm tra kết nối với các peer khác.
     pub ping: ping::Behaviour,
-    // `relay_client`: Cho phép peer sử dụng các node khác làm relay.
     pub relay_client: relay::client::Behaviour,
-    // `dcutr`: (Direct Connection Upgrade through Relay) để nâng cấp kết nối relay thành kết nối trực tiếp.
     pub dcutr: dcutr::Behaviour,
-    // `autonat`: Tự động xác định loại NAT và địa chỉ public.
     pub autonat: autonat::Behaviour,
-    // `file_transfer`: Behaviour tùy chỉnh để xử lý logic truyền file.
     pub file_transfer: FileTransferBehaviour,
 }
 
@@ -136,9 +124,10 @@ impl FileMeshPeer {
             local_key.public(),
         ));
         let ping = ping::Behaviour::new(ping::Config::new());
-        // Kích hoạt relay client. `new` trả về một `Transport` và một `Behaviour`.
-        let (relay_transport, relay_client) =
-            relay::client::new(local_peer_id);
+
+        // `relay::client::new` trả về một tuple (Transport, Behaviour).
+        let (relay_transport, relay_client) = relay::client::new(local_peer_id);
+
         let dcutr = dcutr::Behaviour::new(local_peer_id);
         let autonat = autonat::Behaviour::new(
             local_peer_id,
@@ -151,12 +140,13 @@ impl FileMeshPeer {
         );
         let file_transfer = FileTransferBehaviour::new();
 
-        // Xây dựng transport layer: kết hợp TCP, Relay, Noise (mã hóa), và Yamux (multiplexing).
+        // Xây dựng transport layer (phiên bản đơn giản hóa, không có DNS để gỡ lỗi).
         let transport = relay_transport
-            .or_transport(tcp::tokio::Transport::default())
+            .or_transport(tcp::tokio::Transport::new(tcp::Config::new().nodelay(true)))
             .upgrade(libp2p::core::upgrade::Version::V1)
             .authenticate(noise::Config::new(&local_key)?)
             .multiplex(yamux::Config::default())
+            .timeout(Duration::from_secs(20))
             .boxed();
 
         // Kết hợp các behaviour lại.
@@ -171,7 +161,7 @@ impl FileMeshPeer {
             file_transfer,
         };
 
-        // Tạo Swarm, là thành phần cốt lõi quản lý kết nối và behaviour.
+        // Tạo Swarm.
         let mut swarm = Swarm::new(
             transport,
             behaviour,
@@ -181,9 +171,11 @@ impl FileMeshPeer {
         );
 
         // Quay số đến các bootstrap node để khám phá mạng lưới.
+        // Lưu ý: Các địa chỉ DNS sẽ thất bại ở bước này, nhưng không làm crash chương trình.
         for addr in BOOTSTRAP_NODES.iter() {
-            let remote_addr: Multiaddr = addr.parse()?;
-            swarm.dial(remote_addr)?;
+            if let Ok(remote_addr) = addr.parse::<Multiaddr>() {
+                swarm.dial(remote_addr)?;
+            }
         }
 
         let room = Room::new(room_name, local_peer_id);
@@ -208,9 +200,11 @@ impl FileMeshPeer {
         // Điều này yêu cầu swarm kết nối đến relay và thiết lập một "địa chỉ chuyển tiếp".
         // Các peer khác sau đó có thể kết nối đến chúng ta thông qua địa chỉ này.
         for addr in RELAY_NODES.iter() {
-            let relay_addr: Multiaddr = addr.parse()?;
-            self.swarm
-                .listen_on(relay_addr.with(libp2p::multiaddr::Protocol::P2pCircuit))?;
+            if let Ok(relay_addr) = addr.parse::<Multiaddr>() {
+                self.swarm
+                    .listen_on(relay_addr.with(libp2p::multiaddr::Protocol::P2pCircuit))
+                    .expect("Listen on relay failed.");
+            }
         }
 
         // Tham gia vào topic của phòng.
@@ -549,6 +543,16 @@ pub async fn run_peer(
                             "{} {}",
                             "Đang lắng nghe trên:".bright_cyan(),
                             address.to_string().bright_black()
+                        );
+                    }
+
+                    // Bắt lỗi khi không thể kết nối đến một peer khác (bao gồm cả relay).
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        println!(
+                            "{} to {:?}: {}",
+                            "Lỗi kết nối đi".red(),
+                            peer_id,
+                            error
                         );
                     }
 
