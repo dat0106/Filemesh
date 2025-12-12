@@ -37,18 +37,16 @@ enum Commands {
     },
 }
 
-/// Enum `UserCommand` đại diện cho các lệnh mà người dùng có thể nhập trong giao diện dòng lệnh.
-#[derive(Debug, Clone)]
+/// Enum đại diện cho các lệnh mà người dùng có thể nhập.
+#[derive(Debug)]
 pub enum UserCommand {
-    /// Liệt kê tất cả các peer đang kết nối.
     ListPeers,
-    /// Gửi một file.
     SendFile {
         file_path: String,
-        peer_id: Option<PeerId>, // Gửi tới một peer cụ thể.
-        broadcast: bool,         // Hoặc gửi cho tất cả mọi người.
+        peer_id: Option<PeerId>,
+        broadcast: bool,
     },
-    /// Thoát ứng dụng.
+    Dial(String), // Lệnh mới để quay số thủ công
     Quit,
 }
 
@@ -110,6 +108,7 @@ async fn start_peer(name: String, room_name: String) -> Result<()> {
 /// Hàm `handle_user_input` đọc và xử lý các lệnh từ người dùng.
 async fn handle_user_input(cmd_tx: mpsc::UnboundedSender<UserCommand>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use std::io;
 
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -120,7 +119,7 @@ async fn handle_user_input(cmd_tx: mpsc::UnboundedSender<UserCommand>) {
     // Hàm trợ giúp để hiển thị dấu nhắc lệnh.
     fn show_prompt() {
         print!("{} ", ">".bright_cyan());
-        let _ = std::io::stdout().flush();
+        let _ = io::stdout().flush();
     }
 
     show_prompt();
@@ -137,34 +136,42 @@ async fn handle_user_input(cmd_tx: mpsc::UnboundedSender<UserCommand>) {
         let parts: Vec<&str> = input.split_whitespace().collect();
 
         // Xử lý lệnh đầu tiên.
-        match parts.first().map(|s| s.to_ascii_lowercase()).as_deref() {
-            Some("peers") => {
-                // Gửi lệnh `ListPeers` đến luồng peer.
-                let _ = cmd_tx.send(UserCommand::ListPeers);
-            }
+        let command_sent = match parts.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("peers") => cmd_tx.send(UserCommand::ListPeers).is_ok(),
             Some("send") => {
-                // Phân tích và gửi lệnh `SendFile`.
                 if let Some(cmd) = parse_send_command(&parts[1..]) {
-                    let _ = cmd_tx.send(cmd);
+                    cmd_tx.send(cmd).is_ok()
+                } else {
+                    true // Don't break loop if parsing fails
+                }
+            }
+            Some("dial") => {
+                if let Some(addr) = parts.get(1) {
+                    cmd_tx.send(UserCommand::Dial(addr.to_string())).is_ok()
+                } else {
+                    println!("{}", "Lệnh 'dial' yêu cầu một địa chỉ Multiaddr.".red());
+                    true // Don't break loop
                 }
             }
             Some("quit") | Some("exit") => {
-                // Gửi lệnh `Quit` và thoát khỏi vòng lặp.
                 let _ = cmd_tx.send(UserCommand::Quit);
-                break;
+                false // Break loop
             }
             Some("help") => {
-                // Hiển thị thông tin trợ giúp.
                 print_help();
+                true // Don't break loop
             }
             _ => {
-                // Xử lý lệnh không xác định.
                 println!(
                     "{} Sử dụng 'help' để xem các lệnh có sẵn",
                     "Lệnh không xác định.".red()
                 );
-                show_prompt();
+                true // Don't break loop
             }
+        };
+
+        if !command_sent {
+            break;
         }
 
         show_prompt();

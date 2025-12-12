@@ -399,6 +399,20 @@ pub async fn run_peer(
                     UserCommand::SendFile { file_path, peer_id, broadcast } => {
                         peer.send_file(file_path, peer_id, broadcast).await;
                     }
+                    UserCommand::Dial(addr) => {
+                        match addr.parse::<Multiaddr>() {
+                            Ok(multiaddr) => {
+                                if let Err(e) = peer.swarm.dial(multiaddr.clone()) {
+                                    println!("{} {}: {}", "Lỗi khi quay số".red(), addr, e);
+                                } else {
+                                    println!("{} {}", "Đang quay số đến:".cyan(), multiaddr);
+                                }
+                            }
+                            Err(e) => {
+                                println!("{} '{}': {}", "Địa chỉ Multiaddr không hợp lệ".red(), addr, e);
+                            }
+                        }
+                    }
                     UserCommand::Quit => {
                         println!("{}", "Đang tắt peer...".yellow());
                         peer.room.leave(&mut peer.swarm.behaviour_mut().gossipsub).ok();
