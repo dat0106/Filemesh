@@ -277,12 +277,14 @@ impl FileMeshPeer {
                 file_path.bright_white()
             );
 
+            // Lấy ID của tất cả các peer đã kết nối, trừ các server relay.
             let peers: Vec<PeerId> = self
                 .connected_peers
-                .iter()
-                .filter(|(_, info)| info.name.is_some())
-                .map(|(id, _)| *id)
+                .keys()
+                .filter(|id| !self.relay_peers.contains(id))
+                .cloned()
                 .collect();
+
             if peers.is_empty() {
                 println!("{}", "Không có peer nào trong phòng để quảng bá.".red());
                 return;
