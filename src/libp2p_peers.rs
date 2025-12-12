@@ -418,6 +418,11 @@ pub async fn run_peer(
             // Xử lý sự kiện từ Swarm.
             event = peer.swarm.select_next_some() => {
                 match event {
+                    // Sự kiện từ Relay Client, rất quan trọng để gỡ lỗi kết nối.
+                    SwarmEvent::Behaviour(FileMeshBehaviourEvent::RelayClient(event)) => {
+                        println!("{} {:?}", "Sự kiện Relay Client:".bright_yellow(), event);
+                    }
+
                     // Nhận được tin nhắn Gossipsub.
                     SwarmEvent::Behaviour(FileMeshBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                         propagation_source,
