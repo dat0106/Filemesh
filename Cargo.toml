@@ -13,7 +13,6 @@ clap = { version = "4.4", features = ["derive"] }
 # Libp2p for P2P networking
 libp2p = { version = "0.53", features = [
     "tcp",
-    "dns",
     "noise",
     "yamux",
     "gossipsub",
@@ -25,7 +24,7 @@ libp2p = { version = "0.53", features = [
     "autonat",
     "macros",
     "tokio",
-    "rsa" # Thêm tính năng RSA để hỗ trợ các loại khóa khác
+    "rsa"
 ]}
 
 # Async utilities

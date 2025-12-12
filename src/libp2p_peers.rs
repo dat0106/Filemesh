@@ -140,7 +140,7 @@ impl FileMeshPeer {
         );
         let file_transfer = FileTransferBehaviour::new();
 
-        // Xây dựng transport layer (phiên bản đơn giản hóa, không có DNS để gỡ lỗi).
+        // Xây dựng transport layer.
         let transport = relay_transport
             .or_transport(tcp::tokio::Transport::new(tcp::Config::new().nodelay(true)))
             .upgrade(libp2p::core::upgrade::Version::V1)
@@ -171,10 +171,10 @@ impl FileMeshPeer {
         );
 
         // Quay số đến các bootstrap node để khám phá mạng lưới.
-        // Lưu ý: Các địa chỉ DNS sẽ thất bại ở bước này, nhưng không làm crash chương trình.
         for addr in BOOTSTRAP_NODES.iter() {
+            // Chúng ta bỏ qua lỗi parse vì các địa chỉ DNS sẽ thất bại, nhưng điều này là chấp nhận được.
             if let Ok(remote_addr) = addr.parse::<Multiaddr>() {
-                swarm.dial(remote_addr)?;
+                let _ = swarm.dial(remote_addr);
             }
         }
 
@@ -197,8 +197,6 @@ impl FileMeshPeer {
         self.swarm.listen_on("/ip6/::/tcp/0".parse()?)?;
 
         // **QUAN TRỌNG**: Lắng nghe thông qua các relay công khai.
-        // Điều này yêu cầu swarm kết nối đến relay và thiết lập một "địa chỉ chuyển tiếp".
-        // Các peer khác sau đó có thể kết nối đến chúng ta thông qua địa chỉ này.
         for addr in RELAY_NODES.iter() {
             if let Ok(relay_addr) = addr.parse::<Multiaddr>() {
                 self.swarm
@@ -545,7 +543,7 @@ pub async fn run_peer(
                             address.to_string().bright_black()
                         );
                     }
-
+                    
                     // Bắt lỗi khi không thể kết nối đến một peer khác (bao gồm cả relay).
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                         println!(
