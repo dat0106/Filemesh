@@ -417,6 +417,36 @@ pub async fn run_peer(
                             println!("{} {:?}", "Sự kiện Relay Client:".bright_yellow(), event);
                         }
 
+                        // Xử lý sự kiện Ping.
+                        SwarmEvent::Behaviour(FileMeshBehaviourEvent::Ping(event)) => match event {
+                            ping::Event {
+                                peer,
+                                result: Result::Ok(rtt),
+                                ..
+                            } => {
+                                println!(
+                                    "{} {} {} {:?}",
+                                    "Ping thành công tới".bright_green(),
+                                    peer.to_string().bright_black(),
+                                    "trong".bright_black(),
+                                    rtt
+                                );
+                            }
+                            ping::Event {
+                                peer,
+                                result: Result::Err(err),
+                                ..
+                            } => {
+                                println!(
+                                    "{} {} {} {}",
+                                    "Ping thất bại tới".red(),
+                                    peer.to_string().bright_black(),
+                                    ":".red(),
+                                    err
+                                );
+                            }
+                        },
+
                         // Nhận được tin nhắn Gossipsub.
                         SwarmEvent::Behaviour(FileMeshBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                             propagation_source,
