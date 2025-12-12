@@ -27,6 +27,12 @@ const BOOTSTRAP_NODES: [&str; 4] = [
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
 ];
 
+// Danh sách các relay node công khai. Các node này hoạt động như trạm chuyển tiếp
+// để giúp các peer kết nối với nhau khi chúng không thể kết nối trực tiếp (do NAT).
+const RELAY_NODES: [&str; 1] = [
+    "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+];
+
 /// Enum `ConnectionType` biểu diễn trạng thái kết nối của một peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionType {
@@ -130,7 +136,9 @@ impl FileMeshPeer {
             local_key.public(),
         ));
         let ping = ping::Behaviour::new(ping::Config::new());
-        let (_relay_transport, relay_client) = relay::client::new(local_peer_id);
+        // Kích hoạt relay client. `new` trả về một `Transport` và một `Behaviour`.
+        let (relay_transport, relay_client) =
+            relay::client::new(local_peer_id);
         let dcutr = dcutr::Behaviour::new(local_peer_id);
         let autonat = autonat::Behaviour::new(
             local_peer_id,
@@ -144,7 +152,7 @@ impl FileMeshPeer {
         let file_transfer = FileTransferBehaviour::new();
 
         // Xây dựng transport layer: kết hợp TCP, Relay, Noise (mã hóa), và Yamux (multiplexing).
-        let transport = _relay_transport
+        let transport = relay_transport
             .or_transport(tcp::tokio::Transport::default())
             .upgrade(libp2p::core::upgrade::Version::V1)
             .authenticate(noise::Config::new(&local_key)?)
@@ -195,6 +203,15 @@ impl FileMeshPeer {
         // Lắng nghe trên tất cả các interface mạng (0.0.0.0) với một port ngẫu nhiên.
         self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
         self.swarm.listen_on("/ip6/::/tcp/0".parse()?)?;
+
+        // **QUAN TRỌNG**: Lắng nghe thông qua các relay công khai.
+        // Điều này yêu cầu swarm kết nối đến relay và thiết lập một "địa chỉ chuyển tiếp".
+        // Các peer khác sau đó có thể kết nối đến chúng ta thông qua địa chỉ này.
+        for addr in RELAY_NODES.iter() {
+            let relay_addr: Multiaddr = addr.parse()?;
+            self.swarm
+                .listen_on(relay_addr.with(libp2p::multiaddr::Protocol::P2pCircuit))?;
+        }
 
         // Tham gia vào topic của phòng.
         self.room.join(&mut self.swarm.behaviour_mut().gossipsub)?;
