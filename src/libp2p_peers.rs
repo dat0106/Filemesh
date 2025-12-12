@@ -438,8 +438,7 @@ pub async fn run_peer(
                         if message.topic == peer.room.topic().hash() && propagation_source != *peer.local_peer_id() {
                             if let Ok(msg) = String::from_utf8(message.data.clone()) {
                                 // Nếu là tin nhắn "JOIN", cập nhật thông tin peer.
-                                if msg.starts_with("JOIN:") {
-                                    let name = msg.strip_prefix("JOIN:").unwrap_or("Unknown");
+                                if let Some(name) = msg.strip_prefix("JOIN:") {
                                     if !peer.connected_peers.contains_key(&propagation_source) {
                                         peer.handle_new_peer(propagation_source, Vec::new());
                                     }
@@ -455,6 +454,15 @@ pub async fn run_peer(
                                         }
                                     }
                                     let _ = io::stdout().flush();
+                                }
+                                // Nếu là tin nhắn "ADDR", quay số đến địa chỉ đó.
+                                else if let Some(addr_str) = msg.strip_prefix("ADDR:") {
+                                    if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                                        println!("{} {}", "Nhận được địa chỉ, đang quay số:".cyan(), addr);
+                                        if let Err(e) = peer.swarm.dial(addr) {
+                                            println!("{} {}", "Lỗi khi quay số địa chỉ nhận được:".red(), e);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -549,25 +557,31 @@ pub async fn run_peer(
                         }
                     }
 
-                    // Một địa chỉ lắng nghe mới được mở.
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        println!(
-                            "{} {}",
-                            "Đang lắng nghe trên:".bright_cyan(),
-                            address.to_string().bright_black()
-                        );
-                    }
+                                        // Một địa chỉ lắng nghe mới được mở.
+                                        SwarmEvent::NewListenAddr { address, .. } => {
+                                            println!(
+                                                "{} {}",
+                                                "Đang lắng nghe trên:".bright_cyan(),
+                                                address.to_string().bright_black()
+                                            );
+                                            // Nếu đây là một địa chỉ relay, quảng bá nó cho các peer khác.
+                                            if address.to_string().contains("/p2p-circuit") {
+                                                let msg = format!("ADDR:{}", address);
+                                                if let Err(e) = peer.room.broadcast(&mut peer.swarm.behaviour_mut().gossipsub, msg.as_bytes()) {
+                                                    println!("{} {}", "Không thể quảng bá địa chỉ relay:".red(), e);
+                                                }
+                                            }
+                                        }
                     
-                    // Bắt lỗi khi không thể kết nối đến một peer khác (bao gồm cả relay).
-                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                        println!(
-                            "{} to {:?}: {}",
-                            "Lỗi kết nối đi".red(),
-                            peer_id,
-                            error
-                        );
-                    }
-
+                                        // Bắt lỗi khi không thể kết nối đến một peer khác (bao gồm cả relay).
+                                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                                            println!(
+                                                "{} to {:?}: {}",
+                                                "Lỗi kết nối đi".red(),
+                                                peer_id,
+                                                error
+                                            );
+                                        }
                     // Thiết lập kết nối thành công.
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         let addrs = vec![endpoint.get_remote_address().clone()];
