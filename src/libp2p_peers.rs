@@ -130,7 +130,7 @@ impl FileMeshPeer {
             identify::Config::new(PROTOCOL_VERSION.to_string(), local_key.public())
                 .with_agent_version(format!("filemesh-rs/0.1.0 (peer_name: {})", peer_name)),
         );
-        let ping = ping::Behaviour::new(ping::Config::new());
+        let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(10)));
 
         // `relay::client::new` trả về một tuple (Transport, Behaviour).
         let (relay_transport, relay_client) = relay::client::new(local_peer_id);
