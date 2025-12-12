@@ -68,6 +68,13 @@ pub struct PeerInfo {
     pub addrs: Vec<Multiaddr>,
 }
 
+/// Helper function to parse peer name from agent version string.
+fn parse_peer_name_from_agent_version(agent_version: &str) -> Option<&str> {
+    agent_version
+        .strip_prefix("filemesh-rs/0.1.0 (peer_name: ")
+        .and_then(|s| s.strip_suffix(')'))
+}
+
 /// `FileMeshPeer` là cấu trúc chính quản lý trạng thái của một peer.
 pub struct FileMeshPeer {
     swarm: Swarm<FileMeshBehaviour>,
@@ -119,10 +126,10 @@ impl FileMeshPeer {
 
         // Cấu hình các behaviour khác.
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
-        let identify = identify::Behaviour::new(identify::Config::new(
-            PROTOCOL_VERSION.to_string(),
-            local_key.public(),
-        ));
+        let identify = identify::Behaviour::new(
+            identify::Config::new(PROTOCOL_VERSION.to_string(), local_key.public())
+                .with_agent_version(format!("filemesh-rs/0.1.0 (peer_name: {})", peer_name)),
+        );
         let ping = ping::Behaviour::new(ping::Config::new());
 
         // `relay::client::new` trả về một tuple (Transport, Behaviour).
@@ -490,7 +497,20 @@ pub async fn run_peer(
                             peer_id,
                             info,
                         })) => {
-                            peer.handle_new_peer(peer_id, info.listen_addrs.clone());
+                            if let Some(name) = parse_peer_name_from_agent_version(&info.agent_version) {
+                                if let Some(peer_info) = peer.connected_peers.get_mut(&peer_id) {
+                                    if peer_info.name.is_none() {
+                                        peer_info.name = Some(name.to_string());
+                                    }
+                                } else {
+                                    peer.handle_new_peer(peer_id, info.listen_addrs.clone());
+                                    if let Some(peer_info) = peer.connected_peers.get_mut(&peer_id) {
+                                        peer_info.name = Some(name.to_string());
+                                    }
+                                }
+                            } else {
+                                peer.handle_new_peer(peer_id, info.listen_addrs.clone());
+                            }
 
                             for addr in &info.listen_addrs {
                                 peer.swarm.add_external_address(addr.clone());
