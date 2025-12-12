@@ -237,21 +237,15 @@ impl FileMeshPeer {
         );
         println!();
 
-        let room_members: Vec<_> = self
-            .connected_peers
-            .iter()
-            .filter(|(_, info)| info.name.is_some())
-            .collect();
-
-        if room_members.is_empty() {
+        if self.connected_peers.is_empty() {
             println!("{}", "  Chưa có peer nào trong phòng.".bright_black());
             println!();
             let _ = io::stdout().flush();
             return;
         }
 
-        for (i, (peer_id, info)) in room_members.iter().enumerate() {
-            let name = info.name.as_ref().unwrap();
+        for (i, (peer_id, info)) in self.connected_peers.iter().enumerate() {
+            let name = info.name.as_deref().unwrap_or("(Unknown)");
 
             println!(
                 "  {}. {} ({})",
