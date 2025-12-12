@@ -378,6 +378,11 @@ pub async fn run_peer(
                         if message.topic == peer.room.topic().hash() && propagation_source != *peer.swarm.local_peer_id() {
                             if let Ok(msg) = String::from_utf8(message.data.clone()) {
                                 if let Some(name) = msg.strip_prefix("JOIN:") {
+                                    // Nếu chưa biết peer này, hãy thêm vào danh sách.
+                                    if !peer.connected_peers.contains_key(&propagation_source) {
+                                        peer.handle_new_peer(propagation_source, &[]);
+                                    }
+                                    // Bây giờ, cập nhật tên cho peer.
                                     if let Some(info) = peer.connected_peers.get_mut(&propagation_source) {
                                         if info.name.is_none() {
                                             info.name = Some(name.to_string());
