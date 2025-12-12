@@ -1,3 +1,7 @@
+// Khai báo các module con của project.
+// `file_transfer`: Xử lý logic truyền file.
+// `libp2p_peers`: Quản lý các kết nối mạng P2P bằng libp2p.
+// `room`: Quản lý phòng chat và các chủ đề (topic) gossipsub.
 mod file_transfer;
 mod libp2p_peers;
 mod room;
@@ -9,43 +13,53 @@ use libp2p::PeerId;
 use std::io::Write;
 use tokio::sync::mpsc;
 
+/// Cấu trúc `Cli` sử dụng `clap` để phân tích các đối số dòng lệnh.
 #[derive(Parser, Debug)]
 #[command(name = "FileMesh-RS")]
-#[command(about = "Peer-to-peer file transfer using libp2p", long_about = None)]
+#[command(about = "Truyền file P2P sử dụng libp2p", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
 
+/// Enum `Commands` định nghĩa các lệnh con mà ứng dụng hỗ trợ.
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start a peer and join a room
+    /// Bắt đầu một peer và tham gia vào một phòng.
     Start {
-        /// Peer name
+        /// Tên của peer
         #[arg(short, long)]
         name: String,
 
-        /// Room name to join
+        /// Tên phòng để tham gia
         #[arg(short, long)]
         room: String,
     },
 }
 
+/// Enum `UserCommand` đại diện cho các lệnh mà người dùng có thể nhập trong giao diện dòng lệnh.
 #[derive(Debug, Clone)]
 pub enum UserCommand {
+    /// Liệt kê tất cả các peer đang kết nối.
     ListPeers,
+    /// Gửi một file.
     SendFile {
         file_path: String,
-        peer_id: Option<PeerId>,
-        broadcast: bool,
+        peer_id: Option<PeerId>, // Gửi tới một peer cụ thể.
+        broadcast: bool,         // Hoặc gửi cho tất cả mọi người.
     },
+    /// Thoát ứng dụng.
     Quit,
 }
 
+/// Hàm `main` là điểm khởi đầu của chương trình.
+/// Nó sử dụng `tokio::main` để chạy trong một môi trường bất đồng bộ.
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Phân tích các đối số dòng lệnh.
     let cli = Cli::parse();
 
+    // Xử lý lệnh con được cung cấp.
     match cli.command {
         Commands::Start { name, room } => {
             start_peer(name, room).await?;
@@ -55,7 +69,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Hàm `start_peer` khởi tạo và chạy một node P2P.
 async fn start_peer(name: String, room_name: String) -> Result<()> {
+    // In banner chào mừng.
     println!(
         "{}",
         "╔══════════════════════════════════════════════════╗".bright_cyan()
@@ -70,33 +86,38 @@ async fn start_peer(name: String, room_name: String) -> Result<()> {
     );
     println!();
 
+    // Tạo một kênh (channel) để giao tiếp giữa luồng xử lý input của người dùng và luồng mạng.
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
+    // Spawn một task mới để chạy logic của peer.
     let peer_handle = tokio::spawn(async move {
         if let Err(e) = libp2p_peers::run_peer(name, room_name, cmd_rx).await {
-            eprintln!("{} {}", "Error running peer:".red(), e);
+            eprintln!("{} {}", "Lỗi khi chạy peer:".red(), e);
         }
     });
 
+    // Spawn một task khác để xử lý input từ người dùng.
     tokio::spawn(async move {
         handle_user_input(cmd_tx).await;
     });
 
+    // Chờ cho đến khi task của peer kết thúc.
     peer_handle.await?;
 
     Ok(())
 }
 
+/// Hàm `handle_user_input` đọc và xử lý các lệnh từ người dùng.
 async fn handle_user_input(cmd_tx: mpsc::UnboundedSender<UserCommand>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
 
-    // Show quick usage once
+    // Hiển thị hướng dẫn sử dụng ngắn gọn khi bắt đầu.
     print_help();
 
-    // prompt helper
+    // Hàm trợ giúp để hiển thị dấu nhắc lệnh.
     fn show_prompt() {
         print!("{} ", ">".bright_cyan());
         let _ = std::io::stdout().flush();
@@ -104,6 +125,7 @@ async fn handle_user_input(cmd_tx: mpsc::UnboundedSender<UserCommand>) {
 
     show_prompt();
 
+    // Vòng lặp để đọc từng dòng input từ người dùng.
     while let Ok(Some(line)) = lines.next_line().await {
         let input = line.trim();
         if input.is_empty() {
@@ -111,29 +133,35 @@ async fn handle_user_input(cmd_tx: mpsc::UnboundedSender<UserCommand>) {
             continue;
         }
 
-        // split by whitespace, preserve existing behavior
+        // Tách input thành các phần dựa trên khoảng trắng.
         let parts: Vec<&str> = input.split_whitespace().collect();
 
+        // Xử lý lệnh đầu tiên.
         match parts.first().map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("peers") => {
+                // Gửi lệnh `ListPeers` đến luồng peer.
                 let _ = cmd_tx.send(UserCommand::ListPeers);
             }
             Some("send") => {
+                // Phân tích và gửi lệnh `SendFile`.
                 if let Some(cmd) = parse_send_command(&parts[1..]) {
                     let _ = cmd_tx.send(cmd);
                 }
             }
             Some("quit") | Some("exit") => {
+                // Gửi lệnh `Quit` và thoát khỏi vòng lặp.
                 let _ = cmd_tx.send(UserCommand::Quit);
                 break;
             }
             Some("help") => {
+                // Hiển thị thông tin trợ giúp.
                 print_help();
             }
             _ => {
+                // Xử lý lệnh không xác định.
                 println!(
-                    "{} Use 'help' to see available commands",
-                    "Unknown command.".red()
+                    "{} Sử dụng 'help' để xem các lệnh có sẵn",
+                    "Lệnh không xác định.".red()
                 );
                 show_prompt();
             }
@@ -143,6 +171,7 @@ async fn handle_user_input(cmd_tx: mpsc::UnboundedSender<UserCommand>) {
     }
 }
 
+/// Hàm `parse_send_command` phân tích các đối số của lệnh `send`.
 fn parse_send_command(args: &[&str]) -> Option<UserCommand> {
     let mut file_path: Option<String> = None;
     let mut peer_id: Option<PeerId> = None;
@@ -156,7 +185,7 @@ fn parse_send_command(args: &[&str]) -> Option<UserCommand> {
                     file_path = Some(args[i + 1].to_string());
                     i += 2;
                 } else {
-                    println!("{}", "Missing file path after --file".red());
+                    println!("{}", "Thiếu đường dẫn file sau --file".red());
                     return None;
                 }
             }
@@ -168,12 +197,12 @@ fn parse_send_command(args: &[&str]) -> Option<UserCommand> {
                             i += 2;
                         }
                         Err(_) => {
-                            println!("{}", "Invalid peer ID format".red());
+                            println!("{}", "Định dạng Peer ID không hợp lệ".red());
                             return None;
                         }
                     }
                 } else {
-                    println!("{}", "Missing peer ID after --to".red());
+                    println!("{}", "Thiếu Peer ID sau --to".red());
                     return None;
                 }
             }
@@ -182,25 +211,27 @@ fn parse_send_command(args: &[&str]) -> Option<UserCommand> {
                 i += 1;
             }
             _ => {
-                println!("{} {}", "Unknown argument:".red(), args[i]);
+                println!("{} {}", "Đối số không xác định:".red(), args[i]);
                 return None;
             }
         }
     }
 
+    // Kiểm tra các đối số bắt buộc.
     if file_path.is_none() {
-        println!("{}", "Missing required --file argument".red());
+        println!("{}", "Thiếu đối số --file bắt buộc".red());
         return None;
     }
 
     if !broadcast && peer_id.is_none() {
         println!(
             "{}",
-            "Must specify either --to <PEER_ID> or --broadcast".red()
+            "Phải chỉ định --to <PEER_ID> hoặc --broadcast".red()
         );
         return None;
     }
 
+    // Trả về lệnh `SendFile` đã được phân tích.
     Some(UserCommand::SendFile {
         file_path: file_path.unwrap(),
         peer_id,
@@ -208,22 +239,23 @@ fn parse_send_command(args: &[&str]) -> Option<UserCommand> {
     })
 }
 
+/// Hàm `print_help` in ra thông tin hướng dẫn sử dụng các lệnh.
 fn print_help() {
     println!();
-    println!("{}", "Available commands:".bright_yellow());
+    println!("{}", "Các lệnh có sẵn:".bright_yellow());
     println!();
     println!("  {}", "peers".bright_green());
-    println!("    List all connected peers with connection types");
+    println!("    Liệt kê tất cả các peer đã kết nối và loại kết nối.");
     println!();
     println!("  {}", "send --file <FILE> --to <PEER_ID>".bright_green());
-    println!("    Send a file to a specific peer");
-    println!("    Example: send --file document.pdf --to 12D3KooW...");
+    println!("    Gửi một file đến một peer cụ thể.");
+    println!("    Ví dụ: send --file document.pdf --to 12D3KooW...");
     println!();
     println!("  {}", "send --file <FILE> --broadcast".bright_green());
-    println!("    Broadcast a file to all peers in the room");
-    println!("    Example: send --file photo.jpg --broadcast");
+    println!("    Gửi một file đến tất cả các peer trong phòng.");
+    println!("    Ví dụ: send --file photo.jpg --broadcast");
     println!();
     println!("  {}", "quit / exit".bright_green());
-    println!("    Exit the application");
+    println!("    Thoát ứng dụng.");
     println!();
 }

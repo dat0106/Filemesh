@@ -1,3 +1,4 @@
+// Import các module và thư viện cần thiết.
 use crate::file_transfer::{FileTransferBehaviour, FileTransferEvent};
 use crate::room::Room;
 use crate::UserCommand;
@@ -11,16 +12,27 @@ use libp2p::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+// Hằng số định nghĩa phiên bản giao thức của ứng dụng.
 const PROTOCOL_VERSION: &str = "/filemesh/1.0.0";
 
+// Danh sách các bootstrap node công khai của IPFS để khám phá peer.
+const BOOTSTRAP_NODES: [&str; 4] = [
+    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTf5zyPAPRU8KqUiCoE",
+    "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+    "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+];
+
+/// Enum `ConnectionType` biểu diễn trạng thái kết nối của một peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionType {
-    Direct,
-    Relayed,
-    HolePunched,
+    Direct,      // Kết nối trực tiếp.
+    Relayed,     // Kết nối thông qua một relay.
+    HolePunched, // Kết nối đã được "đục lỗ" (hole-punched).
 }
 
 impl std::fmt::Display for ConnectionType {
@@ -33,24 +45,36 @@ impl std::fmt::Display for ConnectionType {
     }
 }
 
+/// `FileMeshBehaviour` kết hợp nhiều `NetworkBehaviour` khác nhau thành một.
+/// Đây là "bộ não" của node mạng, định nghĩa cách nó hành xử.
 #[derive(NetworkBehaviour)]
 pub struct FileMeshBehaviour {
+    // `gossipsub`: Để lan truyền tin nhắn trong mạng (pub/sub).
     pub gossipsub: gossipsub::Behaviour,
+    // `mdns`: Để khám phá các peer khác trong cùng mạng cục bộ.
     pub mdns: mdns::tokio::Behaviour,
+    // `identify`: Để xác định thông tin của các peer khác (địa chỉ, giao thức).
     pub identify: identify::Behaviour,
+    // `ping`: Để kiểm tra kết nối với các peer khác.
     pub ping: ping::Behaviour,
+    // `relay_client`: Cho phép peer sử dụng các node khác làm relay.
     pub relay_client: relay::client::Behaviour,
+    // `dcutr`: (Direct Connection Upgrade through Relay) để nâng cấp kết nối relay thành kết nối trực tiếp.
     pub dcutr: dcutr::Behaviour,
+    // `autonat`: Tự động xác định loại NAT và địa chỉ public.
     pub autonat: autonat::Behaviour,
+    // `file_transfer`: Behaviour tùy chỉnh để xử lý logic truyền file.
     pub file_transfer: FileTransferBehaviour,
 }
 
+/// `PeerInfo` lưu trữ thông tin về một peer đã kết nối.
 pub struct PeerInfo {
     pub name: Option<String>,
     pub connection_type: ConnectionType,
     pub addrs: Vec<Multiaddr>,
 }
 
+/// `FileMeshPeer` là cấu trúc chính quản lý trạng thái của một peer.
 pub struct FileMeshPeer {
     swarm: Swarm<FileMeshBehaviour>,
     room: Room,
@@ -61,68 +85,65 @@ pub struct FileMeshPeer {
 }
 
 impl FileMeshPeer {
+    /// Gửi tin nhắn quảng bá rằng peer này đã tham gia phòng.
     fn broadcast_join(&mut self) {
         let join_msg = format!("JOIN:{}", self.peer_name);
         if let Err(e) = self.room.broadcast(
             &mut self.swarm.behaviour_mut().gossipsub,
             join_msg.as_bytes(),
         ) {
-            eprintln!("{} {}", "Failed to broadcast join:".red(), e);
+            eprintln!("{} {}", "Không thể quảng bá tham gia:".red(), e);
         }
         self.has_broadcasted_join = true;
     }
 
+    /// Tạo một `FileMeshPeer` mới.
     pub async fn new(peer_name: String, room_name: String) -> Result<Self> {
+        // Tạo cặp khóa định danh cho peer.
         let local_key = libp2p::identity::Keypair::generate_ed25519();
         let local_peer_id = PeerId::from(local_key.public());
 
         println!(
             "{} {} ({})",
-            "Starting peer:".bright_cyan(),
+            "Khởi tạo peer:".bright_cyan(),
             peer_name.bright_white(),
             local_peer_id.to_string().bright_black()
         );
 
+        // Cấu hình Gossipsub.
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_secs(1))
             .validation_mode(gossipsub::ValidationMode::Strict)
             .build()
-            .context("Invalid gossipsub config")?;
+            .context("Cấu hình gossipsub không hợp lệ")?;
 
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(local_key.clone()),
             gossipsub_config,
         )
-        .map_err(|e| anyhow::anyhow!("Failed to create gossipsub behaviour: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Không thể tạo gossipsub behaviour: {}", e))?;
 
+        // Cấu hình các behaviour khác.
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
-
         let identify = identify::Behaviour::new(identify::Config::new(
             PROTOCOL_VERSION.to_string(),
             local_key.public(),
         ));
-
         let ping = ping::Behaviour::new(ping::Config::new());
-
-        let (mut _relay_transport, relay_client) = relay::client::new(local_peer_id);
-
+        let (_relay_transport, relay_client) = relay::client::new(local_peer_id);
         let dcutr = dcutr::Behaviour::new(local_peer_id);
-
         let autonat = autonat::Behaviour::new(
             local_peer_id,
             autonat::Config {
                 retry_interval: Duration::from_secs(10),
                 refresh_interval: Duration::from_secs(30),
                 boot_delay: Duration::from_secs(5),
-                throttle_server_period: Duration::from_secs(1),
                 ..Default::default()
             },
         );
-
         let file_transfer = FileTransferBehaviour::new();
 
-        // Combine relay transport with direct TCP transport so that relay client
-        // stays alive and can establish relayed connections.
+        // Xây dựng transport layer: kết hợp TCP, Relay, Noise (mã hóa), và Yamux (multiplexing).
         let transport = _relay_transport
             .or_transport(tcp::tokio::Transport::default())
             .upgrade(libp2p::core::upgrade::Version::V1)
@@ -130,6 +151,7 @@ impl FileMeshPeer {
             .multiplex(yamux::Config::default())
             .boxed();
 
+        // Kết hợp các behaviour lại.
         let behaviour = FileMeshBehaviour {
             gossipsub,
             mdns,
@@ -141,13 +163,20 @@ impl FileMeshPeer {
             file_transfer,
         };
 
-        let swarm = Swarm::new(
+        // Tạo Swarm, là thành phần cốt lõi quản lý kết nối và behaviour.
+        let mut swarm = Swarm::new(
             transport,
             behaviour,
             local_peer_id,
             libp2p::swarm::Config::with_tokio_executor()
                 .with_idle_connection_timeout(Duration::from_secs(60)),
         );
+
+        // Quay số đến các bootstrap node để khám phá mạng lưới.
+        for addr in BOOTSTRAP_NODES.iter() {
+            let remote_addr: Multiaddr = addr.parse()?;
+            swarm.dial(remote_addr)?;
+        }
 
         let room = Room::new(room_name, local_peer_id);
 
@@ -161,23 +190,28 @@ impl FileMeshPeer {
         })
     }
 
+    /// Bắt đầu peer lắng nghe kết nối và tham gia phòng.
     pub async fn start(&mut self) -> Result<()> {
+        // Lắng nghe trên tất cả các interface mạng (0.0.0.0) với một port ngẫu nhiên.
         self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+        self.swarm.listen_on("/ip6/::/tcp/0".parse()?)?;
 
+        // Tham gia vào topic của phòng.
         self.room.join(&mut self.swarm.behaviour_mut().gossipsub)?;
         self.broadcast_join();
         println!(
             "{} {}",
-            "Joined room:".bright_cyan(),
+            "Đã tham gia phòng:".bright_cyan(),
             self.room.name().bright_white()
         );
         println!();
-        println!("{}", "Listening for connections...".bright_black());
+        println!("{}", "Đang lắng nghe kết nối...".bright_black());
         println!();
 
         Ok(())
     }
 
+    /// Liệt kê các peer trong phòng.
     pub fn list_peers(&self) {
         println!();
         println!(
@@ -186,7 +220,7 @@ impl FileMeshPeer {
         );
         println!(
             "{}",
-            "║           Room Members                     ║".bright_cyan()
+            "║           Thành viên trong phòng           ║".bright_cyan()
         );
         println!(
             "{}",
@@ -201,7 +235,7 @@ impl FileMeshPeer {
             .collect();
 
         if room_members.is_empty() {
-            println!("{}", "  No peers in the room yet.".bright_black());
+            println!("{}", "  Chưa có peer nào trong phòng.".bright_black());
             println!();
             let _ = io::stdout().flush();
             return;
@@ -216,13 +250,13 @@ impl FileMeshPeer {
                 name.bright_yellow(),
                 peer_id.to_string().bright_black()
             );
-            println!("     Connection Type: {}", info.connection_type);
+            println!("     Loại kết nối: {}", info.connection_type);
             println!(
-                "     Addresses: {}",
+                "     Địa chỉ: {}",
                 info.addrs
                     .first()
                     .map(|a| a.to_string())
-                    .unwrap_or_else(|| "None".to_string())
+                    .unwrap_or_else(|| "Không có".to_string())
                     .bright_black()
             );
             println!();
@@ -231,11 +265,12 @@ impl FileMeshPeer {
         let _ = io::stdout().flush();
     }
 
+    /// Gửi một file đến một peer cụ thể hoặc quảng bá cho tất cả.
     pub async fn send_file(&mut self, file_path: String, peer_id: Option<PeerId>, broadcast: bool) {
         if broadcast {
             println!(
                 "{} {}",
-                "Broadcasting file:".bright_cyan(),
+                "Đang quảng bá file:".bright_cyan(),
                 file_path.bright_white()
             );
 
@@ -246,7 +281,7 @@ impl FileMeshPeer {
                 .map(|(id, _)| *id)
                 .collect();
             if peers.is_empty() {
-                println!("{}", "No peers in the room to broadcast to.".red());
+                println!("{}", "Không có peer nào trong phòng để quảng bá.".red());
                 return;
             }
 
@@ -258,7 +293,7 @@ impl FileMeshPeer {
             }
         } else if let Some(target_peer) = peer_id {
             if !self.connected_peers.contains_key(&target_peer) {
-                println!("{}", "Peer not connected.".red());
+                println!("{}", "Peer không được kết nối.".red());
                 return;
             }
             if self
@@ -267,15 +302,15 @@ impl FileMeshPeer {
                 .and_then(|info| info.name.as_ref())
                 .is_none()
             {
-                println!("{}", "Peer not in the room.".red());
+                println!("{}", "Peer không ở trong phòng.".red());
                 return;
             }
 
             println!(
                 "{} {} {} {}",
-                "Sending file:".bright_cyan(),
+                "Đang gửi file:".bright_cyan(),
                 file_path.bright_white(),
-                "to".bright_black(),
+                "tới".bright_black(),
                 target_peer.to_string().bright_black()
             );
 
@@ -286,13 +321,14 @@ impl FileMeshPeer {
         }
     }
 
+    /// Cập nhật loại kết nối của một peer.
     fn update_connection_type(&mut self, peer_id: PeerId, conn_type: ConnectionType) {
         if let Some(info) = self.connected_peers.get_mut(&peer_id) {
             if info.connection_type != conn_type {
                 info.connection_type = conn_type.clone();
                 println!(
                     "{} {} {}",
-                    "Connection upgraded:".bright_green(),
+                    "Kết nối được nâng cấp:".bright_green(),
                     peer_id.to_string().bright_black(),
                     conn_type
                 );
@@ -304,6 +340,7 @@ impl FileMeshPeer {
         self.room.local_peer_id()
     }
 
+    /// Xử lý khi một peer mới được phát hiện hoặc kết nối.
     fn handle_new_peer(&mut self, peer_id: PeerId, addrs: Vec<Multiaddr>) {
         let is_relayed = addrs
             .iter()
@@ -329,6 +366,7 @@ impl FileMeshPeer {
     }
 }
 
+/// Vòng lặp chính của peer, xử lý các sự kiện từ Swarm và lệnh từ người dùng.
 pub async fn run_peer(
     peer_name: String,
     room_name: String,
@@ -338,28 +376,32 @@ pub async fn run_peer(
     peer.start().await?;
 
     loop {
-        // Prioritize handling user commands to keep the UI responsive.
+        // `tokio::select!` cho phép xử lý đồng thời nhiều sự kiện.
+        // `biased` ưu tiên xử lý lệnh người dùng để giao diện luôn phản hồi nhanh.
         tokio::select! {
             biased;
+            // Xử lý lệnh từ người dùng.
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     UserCommand::ListPeers => {
-                        println!("{}", "Listing peers...".bright_black());
+                        println!("{}", "Đang liệt kê peers...".bright_black());
                         peer.list_peers();
                     }
                     UserCommand::SendFile { file_path, peer_id, broadcast } => {
                         peer.send_file(file_path, peer_id, broadcast).await;
                     }
                     UserCommand::Quit => {
-                        println!("{}", "Shutting down peer...".yellow());
+                        println!("{}", "Đang tắt peer...".yellow());
                         peer.room.leave(&mut peer.swarm.behaviour_mut().gossipsub).ok();
                         break;
                     }
                 }
             }
 
+            // Xử lý sự kiện từ Swarm.
             event = peer.swarm.select_next_some() => {
                 match event {
+                    // Nhận được tin nhắn Gossipsub.
                     SwarmEvent::Behaviour(FileMeshBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                         propagation_source,
                         message,
@@ -367,10 +409,10 @@ pub async fn run_peer(
                     })) => {
                         if message.topic == peer.room.topic().hash() && propagation_source != *peer.local_peer_id() {
                             if let Ok(msg) = String::from_utf8(message.data.clone()) {
+                                // Nếu là tin nhắn "JOIN", cập nhật thông tin peer.
                                 if msg.starts_with("JOIN:") {
                                     let name = msg.strip_prefix("JOIN:").unwrap_or("Unknown");
                                     if !peer.connected_peers.contains_key(&propagation_source) {
-                                        // Ensure we track peers even if we only see their gossipsub join first.
                                         peer.handle_new_peer(propagation_source, Vec::new());
                                     }
                                     if let Some(info) = peer.connected_peers.get_mut(&propagation_source) {
@@ -380,7 +422,7 @@ pub async fn run_peer(
                                                 "{} {} {}",
                                                 "→".bright_green(),
                                                 name.bright_yellow(),
-                                                "joined the room".bright_black()
+                                                "đã tham gia phòng".bright_black()
                                             );
                                         }
                                     }
@@ -390,6 +432,7 @@ pub async fn run_peer(
                         }
                     }
 
+                    // Khám phá peer mới qua mDNS.
                     SwarmEvent::Behaviour(FileMeshBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                         for (peer_id, addr) in list {
                             peer.swarm.dial(addr.clone()).ok();
@@ -397,6 +440,7 @@ pub async fn run_peer(
                         }
                     }
 
+                    // Nhận thông tin Identify từ peer khác.
                     SwarmEvent::Behaviour(FileMeshBehaviourEvent::Identify(identify::Event::Received {
                         peer_id,
                         info,
@@ -407,35 +451,39 @@ pub async fn run_peer(
                             peer.swarm.add_external_address(addr.clone());
                         }
 
+                        // Nếu peer hỗ trợ relay, thêm vào danh sách relay.
                         if info.protocols.iter().any(|p| p.as_ref() == "/libp2p/circuit/relay/0.2.0/hop") {
                             peer.relay_peers.insert(peer_id);
                             println!(
                                 "{} {}",
-                                "Discovered relay peer:".bright_cyan(),
+                                "Đã khám phá relay peer:".bright_cyan(),
                                 peer_id.to_string().bright_black()
                             );
                         }
                     }
 
+                    // Kết nối được nâng cấp thành công qua hole punching.
                     SwarmEvent::Behaviour(FileMeshBehaviourEvent::Dcutr(dcutr::Event {
                         remote_peer_id,
-                        result: Ok(_connection_id),
+                        result: Ok(_),
                     })) => {
                         peer.update_connection_type(remote_peer_id, ConnectionType::HolePunched);
                     }
 
+                    // Trạng thái NAT thay đổi.
                     SwarmEvent::Behaviour(FileMeshBehaviourEvent::Autonat(autonat::Event::StatusChanged {
                         old,
                         new,
                     })) => {
                         println!(
                             "{} {:?} → {:?}",
-                            "NAT status changed:".bright_cyan(),
+                            "Trạng thái NAT đã thay đổi:".bright_cyan(),
                             old,
                             new
                         );
                     }
 
+                    // Sự kiện từ behaviour truyền file.
                     SwarmEvent::Behaviour(FileMeshBehaviourEvent::FileTransfer(file_event)) => {
                         match file_event {
                             FileTransferEvent::FileReceived { from, file_name, size } => {
@@ -444,59 +492,60 @@ pub async fn run_peer(
                                     .map(|n| n.as_str())
                                     .unwrap_or("Unknown");
 
-
                                 println!(
                                     "{} {} {} {} ({})",
                                     "✓".bright_green(),
-                                    "Received file:".bright_green(),
+                                    "Đã nhận file:".bright_green(),
                                     file_name.bright_white(),
-                                    format!("from {}", peer_name).bright_black(),
+                                    format!("từ {}", peer_name).bright_black(),
                                     format!("{} bytes", size).bright_black()
                                 );
-
                             }
                             FileTransferEvent::FileSent { to, file_name } => {
                                 println!(
                                     "{} {} {} {}",
                                     "✓".bright_green(),
-                                    "Sent file:".bright_green(),
+                                    "Đã gửi file:".bright_green(),
                                     file_name.bright_white(),
-                                    format!("to {}", to.to_string()).bright_black()
+                                    format!("tới {}", to.to_string()).bright_black()
                                 );
                             }
                             FileTransferEvent::Error { error } => {
                                 println!(
                                     "{} {} {}",
                                     "✗".red(),
-                                    "File transfer error:".red(),
+                                    "Lỗi truyền file:".red(),
                                     error
                                 );
                             }
                         }
                     }
 
+                    // Một địa chỉ lắng nghe mới được mở.
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!(
                             "{} {}",
-                            "Listening on:".bright_cyan(),
+                            "Đang lắng nghe trên:".bright_cyan(),
                             address.to_string().bright_black()
                         );
                     }
 
+                    // Thiết lập kết nối thành công.
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         let addrs = vec![endpoint.get_remote_address().clone()];
                         peer.handle_new_peer(peer_id, addrs);
                         peer.broadcast_join();
                     }
 
-                    SwarmEvent::ConnectionClosed { peer_id, cause: _, .. } => {
+                    // Kết nối bị đóng.
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         if let Some(info) = peer.connected_peers.remove(&peer_id) {
                             let name = info.name.as_deref().unwrap_or("Unknown");
                             println!(
                                 "{} {} {}",
                                 "←".bright_red(),
                                 name.bright_yellow(),
-                                "left the room".bright_black()
+                                "đã rời phòng".bright_black()
                             );
                         }
                     }
