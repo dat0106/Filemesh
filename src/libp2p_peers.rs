@@ -277,11 +277,12 @@ impl FileMeshPeer {
                 file_path.bright_white()
             );
 
-            // Lấy ID của tất cả các peer đã kết nối, trừ các server relay.
+            // Lấy ID của tất cả các peer đã kết nối, trừ chính nó.
+            let local_id = *self.swarm.local_peer_id();
             let peers: Vec<PeerId> = self
                 .connected_peers
                 .keys()
-                .filter(|id| !self.relay_peers.contains(id))
+                .filter(|&&id| id != local_id)
                 .cloned()
                 .collect();
 
@@ -384,221 +385,221 @@ pub async fn run_peer(
         // `tokio::select!` cho phép xử lý đồng thời nhiều sự kiện.
         // `biased` ưu tiên xử lý lệnh người dùng để giao diện luôn phản hồi nhanh.
         tokio::select! {
-            biased;
-            // Xử lý lệnh từ người dùng.
-            Some(cmd) = cmd_rx.recv() => {
-                match cmd {
-                    UserCommand::ListPeers => {
-                        println!("{}", "Đang liệt kê peers...".bright_black());
-                        peer.list_peers();
-                    }
-                    UserCommand::SendFile { file_path, peer_id, broadcast } => {
-                        peer.send_file(file_path, peer_id, broadcast).await;
-                    }
-                    UserCommand::Dial(addr) => {
-                        match addr.parse::<Multiaddr>() {
-                            Ok(multiaddr) => {
-                                if let Err(e) = peer.swarm.dial(multiaddr.clone()) {
-                                    println!("{} {}: {}", "Lỗi khi quay số".red(), addr, e);
-                                } else {
-                                    println!("{} {}", "Đang quay số đến:".cyan(), multiaddr);
+                biased;
+                // Xử lý lệnh từ người dùng.
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        UserCommand::ListPeers => {
+                            println!("{}", "Đang liệt kê peers...".bright_black());
+                            peer.list_peers();
+                        }
+                        UserCommand::SendFile { file_path, peer_id, broadcast } => {
+                            peer.send_file(file_path, peer_id, broadcast).await;
+                        }
+                        UserCommand::Dial(addr) => {
+                            match addr.parse::<Multiaddr>() {
+                                Ok(multiaddr) => {
+                                    if let Err(e) = peer.swarm.dial(multiaddr.clone()) {
+                                        println!("{} {}: {}", "Lỗi khi quay số".red(), addr, e);
+                                    } else {
+                                        println!("{} {}", "Đang quay số đến:".cyan(), multiaddr);
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("{} '{}': {}", "Địa chỉ Multiaddr không hợp lệ".red(), addr, e);
                                 }
                             }
-                            Err(e) => {
-                                println!("{} '{}': {}", "Địa chỉ Multiaddr không hợp lệ".red(), addr, e);
-                            }
                         }
-                    }
-                    UserCommand::Dial(addr) => {
-                        match addr.parse::<Multiaddr>() {
-                            Ok(multiaddr) => {
-                                if let Err(e) = peer.swarm.dial(multiaddr.clone()) {
-                                    println!("{} {}: {}", "Lỗi khi quay số".red(), addr, e);
-                                } else {
-                                    println!("{} {}", "Đang quay số đến:".cyan(), multiaddr);
+                        UserCommand::Dial(addr) => {
+                            match addr.parse::<Multiaddr>() {
+                                Ok(multiaddr) => {
+                                    if let Err(e) = peer.swarm.dial(multiaddr.clone()) {
+                                        println!("{} {}: {}", "Lỗi khi quay số".red(), addr, e);
+                                    } else {
+                                        println!("{} {}", "Đang quay số đến:".cyan(), multiaddr);
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("{} '{}': {}", "Địa chỉ Multiaddr không hợp lệ".red(), addr, e);
                                 }
                             }
-                            Err(e) => {
-                                println!("{} '{}': {}", "Địa chỉ Multiaddr không hợp lệ".red(), addr, e);
-                            }
                         }
-                    }
-                    UserCommand::Quit => {
-                        println!("{}", "Đang tắt peer...".yellow());
-                        peer.room.leave(&mut peer.swarm.behaviour_mut().gossipsub).ok();
-                        break;
+                        UserCommand::Quit => {
+                            println!("{}", "Đang tắt peer...".yellow());
+                            peer.room.leave(&mut peer.swarm.behaviour_mut().gossipsub).ok();
+                            break;
+                        }
                     }
                 }
-            }
 
-            // Xử lý sự kiện từ Swarm.
-            event = peer.swarm.select_next_some() => {
-                match event {
-                    // Sự kiện từ Relay Client, rất quan trọng để gỡ lỗi kết nối.
-                    SwarmEvent::Behaviour(FileMeshBehaviourEvent::RelayClient(event)) => {
-                        println!("{} {:?}", "Sự kiện Relay Client:".bright_yellow(), event);
-                    }
+                // Xử lý sự kiện từ Swarm.
+                event = peer.swarm.select_next_some() => {
+                    match event {
+                        // Sự kiện từ Relay Client, rất quan trọng để gỡ lỗi kết nối.
+                        SwarmEvent::Behaviour(FileMeshBehaviourEvent::RelayClient(event)) => {
+                            println!("{} {:?}", "Sự kiện Relay Client:".bright_yellow(), event);
+                        }
 
-                    // Nhận được tin nhắn Gossipsub.
-                    SwarmEvent::Behaviour(FileMeshBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                        propagation_source,
-                        message,
-                        ..
-                    })) => {
-                        if message.topic == peer.room.topic().hash() && propagation_source != *peer.local_peer_id() {
-                            if let Ok(msg) = String::from_utf8(message.data.clone()) {
-                                // Nếu là tin nhắn "JOIN", cập nhật thông tin peer.
-                                if let Some(name) = msg.strip_prefix("JOIN:") {
-                                    if !peer.connected_peers.contains_key(&propagation_source) {
-                                        peer.handle_new_peer(propagation_source, Vec::new());
-                                    }
-                                    if let Some(info) = peer.connected_peers.get_mut(&propagation_source) {
-                                        if info.name.is_none() {
-                                            info.name = Some(name.to_string());
-                                            println!(
-                                                "{} {} {}",
-                                                "→".bright_green(),
-                                                name.bright_yellow(),
-                                                "đã tham gia phòng".bright_black()
-                                            );
+                        // Nhận được tin nhắn Gossipsub.
+                        SwarmEvent::Behaviour(FileMeshBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                            propagation_source,
+                            message,
+                            ..
+                        })) => {
+                            if message.topic == peer.room.topic().hash() && propagation_source != *peer.local_peer_id() {
+                                if let Ok(msg) = String::from_utf8(message.data.clone()) {
+                                    // Nếu là tin nhắn "JOIN", cập nhật thông tin peer.
+                                    if let Some(name) = msg.strip_prefix("JOIN:") {
+                                        if !peer.connected_peers.contains_key(&propagation_source) {
+                                            peer.handle_new_peer(propagation_source, Vec::new());
                                         }
+                                        if let Some(info) = peer.connected_peers.get_mut(&propagation_source) {
+                                            if info.name.is_none() {
+                                                info.name = Some(name.to_string());
+                                                println!(
+                                                    "{} {} {}",
+                                                    "→".bright_green(),
+                                                    name.bright_yellow(),
+                                                    "đã tham gia phòng".bright_black()
+                                                );
+                                            }
+                                        }
+                                        let _ = io::stdout().flush();
                                     }
-                                    let _ = io::stdout().flush();
                                 }
                             }
                         }
-                    }
 
-                    // Khám phá peer mới qua mDNS.
-                    SwarmEvent::Behaviour(FileMeshBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                        for (peer_id, addr) in list {
-                            peer.swarm.dial(addr.clone()).ok();
-                            peer.handle_new_peer(peer_id, vec![addr]);
-                        }
-                    }
-
-                    // Nhận thông tin Identify từ peer khác.
-                    SwarmEvent::Behaviour(FileMeshBehaviourEvent::Identify(identify::Event::Received {
-                        peer_id,
-                        info,
-                    })) => {
-                        peer.handle_new_peer(peer_id, info.listen_addrs.clone());
-
-                        for addr in &info.listen_addrs {
-                            peer.swarm.add_external_address(addr.clone());
+                        // Khám phá peer mới qua mDNS.
+                        SwarmEvent::Behaviour(FileMeshBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                            for (peer_id, addr) in list {
+                                peer.swarm.dial(addr.clone()).ok();
+                                peer.handle_new_peer(peer_id, vec![addr]);
+                            }
                         }
 
-                        // Nếu peer hỗ trợ relay, thêm vào danh sách relay.
-                        if info.protocols.iter().any(|p| p.as_ref() == "/libp2p/circuit/relay/0.2.0/hop") {
-                            peer.relay_peers.insert(peer_id);
+                        // Nhận thông tin Identify từ peer khác.
+                        SwarmEvent::Behaviour(FileMeshBehaviourEvent::Identify(identify::Event::Received {
+                            peer_id,
+                            info,
+                        })) => {
+                            peer.handle_new_peer(peer_id, info.listen_addrs.clone());
+
+                            for addr in &info.listen_addrs {
+                                peer.swarm.add_external_address(addr.clone());
+                            }
+
+                            // Nếu peer hỗ trợ relay, thêm vào danh sách relay.
+                            if info.protocols.iter().any(|p| p.as_ref() == "/libp2p/circuit/relay/0.2.0/hop") {
+                                peer.relay_peers.insert(peer_id);
+                                println!(
+                                    "{} {}",
+                                    "Đã khám phá relay peer:".bright_cyan(),
+                                    peer_id.to_string().bright_black()
+                                );
+                            }
+                        }
+
+                        // Kết nối được nâng cấp thành công qua hole punching.
+                        SwarmEvent::Behaviour(FileMeshBehaviourEvent::Dcutr(dcutr::Event {
+                            remote_peer_id,
+                            result: Ok(_),
+                        })) => {
+                            peer.update_connection_type(remote_peer_id, ConnectionType::HolePunched);
+                        }
+
+                        // Trạng thái NAT thay đổi.
+                        SwarmEvent::Behaviour(FileMeshBehaviourEvent::Autonat(autonat::Event::StatusChanged {
+                            old,
+                            new,
+                        })) => {
                             println!(
-                                "{} {}",
-                                "Đã khám phá relay peer:".bright_cyan(),
-                                peer_id.to_string().bright_black()
+                                "{} {:?} → {:?}",
+                                "Trạng thái NAT đã thay đổi:".bright_cyan(),
+                                old,
+                                new
                             );
                         }
-                    }
 
-                    // Kết nối được nâng cấp thành công qua hole punching.
-                    SwarmEvent::Behaviour(FileMeshBehaviourEvent::Dcutr(dcutr::Event {
-                        remote_peer_id,
-                        result: Ok(_),
-                    })) => {
-                        peer.update_connection_type(remote_peer_id, ConnectionType::HolePunched);
-                    }
+                        // Sự kiện từ behaviour truyền file.
+                        SwarmEvent::Behaviour(FileMeshBehaviourEvent::FileTransfer(file_event)) => {
+                            match file_event {
+                                FileTransferEvent::FileReceived { from, file_name, size } => {
+                                    let peer_name = peer.connected_peers.get(&from)
+                                        .and_then(|p| p.name.as_ref())
+                                        .map(|n| n.as_str())
+                                        .unwrap_or("Unknown");
 
-                    // Trạng thái NAT thay đổi.
-                    SwarmEvent::Behaviour(FileMeshBehaviourEvent::Autonat(autonat::Event::StatusChanged {
-                        old,
-                        new,
-                    })) => {
-                        println!(
-                            "{} {:?} → {:?}",
-                            "Trạng thái NAT đã thay đổi:".bright_cyan(),
-                            old,
-                            new
-                        );
-                    }
+                                    println!(
+                                        "{} {} {} {} ({})",
+                                        "✓".bright_green(),
+                                        "Đã nhận file:".bright_green(),
+                                        file_name.bright_white(),
+                                        format!("từ {}", peer_name).bright_black(),
+                                        format!("{} bytes", size).bright_black()
+                                    );
+                                }
+                                FileTransferEvent::FileSent { to, file_name } => {
+                                    println!(
+                                        "{} {} {} {}",
+                                        "✓".bright_green(),
+                                        "Đã gửi file:".bright_green(),
+                                        file_name.bright_white(),
+                                        format!("tới {}", to.to_string()).bright_black()
+                                    );
+                                }
+                                FileTransferEvent::Error { error } => {
+                                    println!(
+                                        "{} {} {}",
+                                        "✗".red(),
+                                        "Lỗi truyền file:".red(),
+                                        error
+                                    );
+                                }
+                            }
+                        }
 
-                    // Sự kiện từ behaviour truyền file.
-                    SwarmEvent::Behaviour(FileMeshBehaviourEvent::FileTransfer(file_event)) => {
-                        match file_event {
-                            FileTransferEvent::FileReceived { from, file_name, size } => {
-                                let peer_name = peer.connected_peers.get(&from)
-                                    .and_then(|p| p.name.as_ref())
-                                    .map(|n| n.as_str())
-                                    .unwrap_or("Unknown");
-
+                            // Một địa chỉ lắng nghe mới được mở.
+                            SwarmEvent::NewListenAddr { address, .. } => {
                                 println!(
-                                    "{} {} {} {} ({})",
-                                    "✓".bright_green(),
-                                    "Đã nhận file:".bright_green(),
-                                    file_name.bright_white(),
-                                    format!("từ {}", peer_name).bright_black(),
-                                    format!("{} bytes", size).bright_black()
+                                    "{} {}",
+                                    "Đang lắng nghe trên:".bright_cyan(),
+                                    address.to_string().bright_black()
                                 );
                             }
-                            FileTransferEvent::FileSent { to, file_name } => {
-                                println!(
-                                    "{} {} {} {}",
-                                    "✓".bright_green(),
-                                    "Đã gửi file:".bright_green(),
-                                    file_name.bright_white(),
-                                    format!("tới {}", to.to_string()).bright_black()
-                                );
-                            }
-                            FileTransferEvent::Error { error } => {
+
+                            // Bắt lỗi khi không thể kết nối đến một peer khác (bao gồm cả relay).
+                            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {                                            println!(
+                "{} to {:?}: {}",
+                "Lỗi kết nối đi".red(),
+                peer_id,
+                error
+            );
+        }
+                        // Thiết lập kết nối thành công.
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            let addrs = vec![endpoint.get_remote_address().clone()];
+                            peer.handle_new_peer(peer_id, addrs);
+                            peer.broadcast_join();
+                        }
+
+                        // Kết nối bị đóng.
+                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            if let Some(info) = peer.connected_peers.remove(&peer_id) {
+                                let name = info.name.as_deref().unwrap_or("Unknown");
                                 println!(
                                     "{} {} {}",
-                                    "✗".red(),
-                                    "Lỗi truyền file:".red(),
-                                    error
+                                    "←".bright_red(),
+                                    name.bright_yellow(),
+                                    "đã rời phòng".bright_black()
                                 );
                             }
                         }
-                    }
 
-                                                            // Một địa chỉ lắng nghe mới được mở.
-                                                            SwarmEvent::NewListenAddr { address, .. } => {
-                                                                println!(
-                                                                    "{} {}",
-                                                                    "Đang lắng nghe trên:".bright_cyan(),
-                                                                    address.to_string().bright_black()
-                                                                );
-                                                            }
-                                        
-                                                            // Bắt lỗi khi không thể kết nối đến một peer khác (bao gồm cả relay).
-                                                            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {                                            println!(
-                                                "{} to {:?}: {}",
-                                                "Lỗi kết nối đi".red(),
-                                                peer_id,
-                                                error
-                                            );
-                                        }
-                    // Thiết lập kết nối thành công.
-                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                        let addrs = vec![endpoint.get_remote_address().clone()];
-                        peer.handle_new_peer(peer_id, addrs);
-                        peer.broadcast_join();
+                        _ => {}
                     }
-
-                    // Kết nối bị đóng.
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        if let Some(info) = peer.connected_peers.remove(&peer_id) {
-                            let name = info.name.as_deref().unwrap_or("Unknown");
-                            println!(
-                                "{} {} {}",
-                                "←".bright_red(),
-                                name.bright_yellow(),
-                                "đã rời phòng".bright_black()
-                            );
-                        }
-                    }
-
-                    _ => {}
                 }
             }
-        }
     }
 
     Ok(())
