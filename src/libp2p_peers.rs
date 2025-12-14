@@ -75,6 +75,28 @@ fn parse_peer_name_from_agent_version(agent_version: &str) -> Option<&str> {
         .and_then(|s| s.strip_suffix(')'))
 }
 
+/// NAT type detection result
+#[derive(Debug, Clone, PartialEq)]
+pub enum NatType {
+    Unknown,
+    FullCone,           // Tốt nhất - hole punching dễ dàng
+    RestrictedCone,     // Khả thi - hole punching có thể
+    PortRestrictedCone, // Khó - hole punching khó khăn
+    Symmetric,          // Tệ nhất - hole punching không thể
+}
+
+impl std::fmt::Display for NatType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NatType::Unknown => write!(f, "Unknown"),
+            NatType::FullCone => write!(f, "Full Cone NAT (Hole punching: ✓ Dễ dàng)"),
+            NatType::RestrictedCone => write!(f, "Restricted Cone NAT (Hole punching: ✓ Khả thi)"),
+            NatType::PortRestrictedCone => write!(f, "Port Restricted Cone NAT (Hole punching: △ Khó)"),
+            NatType::Symmetric => write!(f, "Symmetric NAT (Hole punching: ✗ Không thể)"),
+        }
+    }
+}
+
 /// `FileMeshPeer` là cấu trúc chính quản lý trạng thái của một peer.
 pub struct FileMeshPeer {
     swarm: Swarm<FileMeshBehaviour>,
@@ -83,6 +105,8 @@ pub struct FileMeshPeer {
     connected_peers: HashMap<PeerId, PeerInfo>,
     relay_peers: HashSet<PeerId>,
     has_broadcasted_join: bool,
+    observed_addrs: HashMap<PeerId, Multiaddr>, // Track observed addresses from different peers
+    nat_type: NatType,
 }
 
 impl FileMeshPeer {
@@ -200,7 +224,82 @@ impl FileMeshPeer {
             connected_peers: HashMap::new(),
             relay_peers: HashSet::new(),
             has_broadcasted_join: false,
+            observed_addrs: HashMap::new(),
+            nat_type: NatType::Unknown,
         })
+    }
+    
+    /// Phân tích NAT type dựa trên observed addresses
+    fn analyze_nat_type(&mut self) {
+        if self.observed_addrs.len() < 2 {
+            return; // Cần ít nhất 2 observations
+        }
+        
+        let addrs: Vec<_> = self.observed_addrs.values().collect();
+        
+        // Lấy IP và Port từ các addresses
+        let mut ips = HashSet::new();
+        let mut ports = HashSet::new();
+        
+        for addr in &addrs {
+            let addr_str = addr.to_string();
+            if let Some(ip_part) = addr_str.split("/tcp/").next() {
+                if let Some(ip) = ip_part.split("/ip4/").nth(1) {
+                    ips.insert(ip.to_string());
+                }
+            }
+            if let Some(port_part) = addr_str.split("/tcp/").nth(1) {
+                if let Some(port) = port_part.split('/').next() {
+                    ports.insert(port.to_string());
+                }
+            }
+        }
+        
+        let old_type = self.nat_type.clone();
+        
+        // Phân tích NAT type
+        self.nat_type = if ips.len() == 1 && ports.len() == 1 {
+            // Cùng IP:Port → Full Cone NAT (tốt nhất)
+            NatType::FullCone
+        } else if ips.len() == 1 && ports.len() > 1 {
+            // Cùng IP nhưng Port khác nhau → Symmetric NAT (tệ nhất)
+            NatType::Symmetric
+        } else if ips.len() > 1 && ports.len() == 1 {
+            // IP khác nhau nhưng cùng Port → Restricted Cone
+            NatType::RestrictedCone
+        } else {
+            // Trường hợp khác → Port Restricted Cone
+            NatType::PortRestrictedCone
+        };
+        
+        // Chỉ hiển thị khi NAT type thay đổi
+        if self.nat_type != old_type && old_type != NatType::Unknown {
+            println!(
+                "\n{} {}",
+                "[🔍 NAT Type]".bright_cyan(),
+                self.nat_type.to_string().bright_white()
+            );
+            
+            if self.nat_type == NatType::Symmetric {
+                println!(
+                    "    {} {}",
+                    "[!]".bright_red(),
+                    "Router của bạn sử dụng Symmetric NAT. Hole punching không khả thi.".bright_yellow()
+                );
+                println!(
+                    "    {} {}",
+                    "[→]".bright_blue(),
+                    "Kết nối sẽ phải sử dụng relay server.".bright_black()
+                );
+            } else if self.nat_type == NatType::FullCone {
+                println!(
+                    "    {} {}",
+                    "[✓]".bright_green(),
+                    "Router hỗ trợ hole punching tốt! DCUtR có khả năng thành công cao.".bright_black()
+                );
+            }
+            println!();
+        }
     }
 
     /// Bắt đầu peer lắng nghe kết nối và tham gia phòng.
@@ -644,11 +743,44 @@ pub async fn run_peer(
                                     "    [i] {}",
                                     "Bạn đang ở sau NAT. Kết nối sẽ sử dụng relay và DCUtR để thiết lập.".bright_black()
                                 );
-                            } else if matches!(new, autonat::NatStatus::Public(_)) {
+                            } else if let autonat::NatStatus::Public(addr) = new {
                                 println!(
-                                    "    [OK] {}",
-                                    "Bạn có địa chỉ công khai. Có thể nhận kết nối trực tiếp.".bright_black()
+                                    "    [OK] {} {}",
+                                    "Bạn có địa chỉ công khai:".bright_black(),
+                                    addr.to_string().bright_white()
                                 );
+                            }
+                        }
+                        
+                        // Nhận observed address từ peer khác qua autonat probes
+                        SwarmEvent::Behaviour(FileMeshBehaviourEvent::Autonat(autonat::Event::InboundProbe(event))) => {
+                            // Khi peer khác probe chúng ta, họ sẽ cho ta biết địa chỉ họ thấy
+                            if let autonat::InboundProbeEvent::Response { address, .. } = event {
+                                println!(
+                                    "{} {} {}",
+                                    "[NAT]".bright_cyan(),
+                                    "Peer probe thấy địa chỉ của chúng ta:".bright_black(),
+                                    address.to_string().bright_white()
+                                );
+                            }
+                        }
+                        
+                        SwarmEvent::Behaviour(FileMeshBehaviourEvent::Autonat(autonat::Event::OutboundProbe(event))) => {
+                            // Khi chúng ta probe peer khác và nhận được response
+                            if let autonat::OutboundProbeEvent::Response { probe_id, peer: probe_peer, address } = event {
+                                println!(
+                                    "{} {} {} {}",
+                                    "[NAT]".bright_cyan(),
+                                    "Peer".bright_black(),
+                                    probe_peer.to_string().bright_white(),
+                                    format!("báo địa chỉ của chúng ta: {}", address).bright_black()
+                                );
+                                
+                                // Lưu observed address từ peer này vào struct của chúng ta
+                                peer.observed_addrs.insert(probe_peer, address.clone());
+                                
+                                // Phân tích NAT type nếu đã có đủ dữ liệu
+                                peer.analyze_nat_type();
                             }
                         }
 
