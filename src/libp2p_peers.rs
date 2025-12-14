@@ -139,9 +139,11 @@ impl FileMeshPeer {
         let autonat = autonat::Behaviour::new(
             local_peer_id,
             autonat::Config {
-                retry_interval: Duration::from_secs(10),
-                refresh_interval: Duration::from_secs(30),
-                boot_delay: Duration::from_secs(5),
+                retry_interval: Duration::from_secs(5),
+                refresh_interval: Duration::from_secs(20),
+                boot_delay: Duration::from_secs(2),
+                throttle_server_period: Duration::ZERO,
+                only_global_ips: false,
                 ..Default::default()
             },
         );
@@ -157,7 +159,7 @@ impl FileMeshPeer {
             .upgrade(libp2p::core::upgrade::Version::V1)
             .authenticate(noise::Config::new(&local_key)?)
             .multiplex(yamux::Config::default())
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(60))
             .boxed();
 
         // Kết hợp các behaviour lại.
@@ -520,6 +522,9 @@ pub async fn run_peer(
                                 peer.swarm.add_external_address(addr.clone());
                             }
 
+                            // Thêm peer này làm autonat server để probe NAT
+                            peer.swarm.behaviour_mut().autonat.add_server(peer_id, info.listen_addrs.first().cloned());
+
                             // Nếu peer hỗ trợ relay, thêm vào danh sách relay.
                             if info.protocols.iter().any(|p| p.as_ref() == "/libp2p/circuit/relay/0.2.0/hop") {
                                 peer.relay_peers.insert(peer_id);
@@ -546,19 +551,30 @@ pub async fn run_peer(
                                     if !direct_addrs.is_empty() {
                                         println!(
                                             "{} {} {}",
-                                            "🎯".bright_cyan(),
+                                            "[→]".bright_cyan(),
                                             "Đã nhận địa chỉ công khai, thử kết nối trực tiếp đến:".bright_cyan(),
                                             peer_id.to_string().bright_black()
                                         );
                                         
-                                        // Thử dial đến địa chỉ đầu tiên
-                                        if let Some(addr) = direct_addrs.first() {
-                                            let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id));
+                                        // Thử dial đến các địa chỉ (libp2p tự động thêm peer_id nếu cần)
+                                        for addr in direct_addrs.iter().take(2) {
+                                            let dial_addr = if addr.to_string().contains(&format!("/p2p/{}", peer_id)) {
+                                                // Địa chỉ đã có peer_id
+                                                addr.clone()
+                                            } else {
+                                                // Thêm peer_id vào địa chỉ
+                                                addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id))
+                                            };
+                                            
+                                            println!(
+                                                "    Thử dial: {}",
+                                                dial_addr.to_string().bright_black()
+                                            );
+                                            
                                             if let Err(e) = peer.swarm.dial(dial_addr.clone()) {
                                                 println!(
-                                                    "{} {} - {}",
-                                                    "⚠".bright_yellow(),
-                                                    "Không thể dial trực tiếp:".bright_yellow(),
+                                                    "    [!] {} - {}",
+                                                    "Lỗi dial:".bright_yellow(),
                                                     e.to_string().bright_black()
                                                 );
                                             }
@@ -588,12 +604,26 @@ pub async fn run_peer(
                             result: Err(err),
                         })) => {
                             println!(
-                                "{} {} {} - {}",
+                                "{} {} {}",
                                 "✗".bright_red(),
                                 "DCUtR thất bại:".bright_red(),
-                                remote_peer_id.to_string().bright_black(),
+                                remote_peer_id.to_string().bright_black()
+                            );
+                            println!(
+                                "    {} {}",
+                                "Lý do:".bright_black(),
                                 err.to_string().bright_black()
                             );
+                            println!(
+                                "    {} {}",
+                                "ℹ".bright_blue(),
+                                "Kết nối sẽ tiếp tục qua relay server. Cả hai peer có thể đang sau NAT.".bright_black()
+                            );
+                            
+                            // Đảm bảo connection type vẫn là Relayed
+                            if let Some(peer_info) = peer.connected_peers.get_mut(&remote_peer_id) {
+                                peer_info.connection_type = ConnectionType::Relayed;
+                            }
                         }
 
                         // Trạng thái NAT thay đổi.
@@ -603,7 +633,7 @@ pub async fn run_peer(
                         })) => {
                             println!(
                                 "{} {:?} → {:?}",
-                                "🌐 Trạng thái NAT đã thay đổi:".bright_cyan(),
+                                "[NAT] Trạng thái NAT đã thay đổi:".bright_cyan(),
                                 old,
                                 new
                             );
@@ -611,14 +641,12 @@ pub async fn run_peer(
                             // Hiển thị gợi ý nếu ở sau NAT
                             if matches!(new, autonat::NatStatus::Private) {
                                 println!(
-                                    "    {} {}",
-                                    "ℹ".bright_blue(),
+                                    "    [i] {}",
                                     "Bạn đang ở sau NAT. Kết nối sẽ sử dụng relay và DCUtR để thiết lập.".bright_black()
                                 );
                             } else if matches!(new, autonat::NatStatus::Public(_)) {
                                 println!(
-                                    "    {} {}",
-                                    "✓".bright_green(),
+                                    "    [OK] {}",
                                     "Bạn có địa chỉ công khai. Có thể nhận kết nối trực tiếp.".bright_black()
                                 );
                             }
@@ -672,12 +700,22 @@ pub async fn run_peer(
                             }
 
                             // Bắt lỗi khi không thể kết nối đến một peer khác (bao gồm cả relay).
-                            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {                                            println!(
-                "{} to {:?}: {}",
-                "Lỗi kết nối đi".red(),
-                peer_id,
-                error
-            );
+                            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                                // Chỉ hiển thị lỗi quan trọng, bỏ qua timeout từ private IP
+                                let error_str = error.to_string();
+                                let is_private_timeout = error_str.contains("Timeout has been reached") && 
+                                    (error_str.contains("/ip4/10.") || 
+                                     error_str.contains("/ip4/172.") || 
+                                     error_str.contains("/ip4/192.168."));
+                                
+                                if !is_private_timeout {
+                                    println!(
+                                        "{} {:?}: {}",
+                                        "Lỗi kết nối".red(),
+                                        peer_id,
+                                        error
+                                    );
+                                }
         }
                         // Thiết lập kết nối thành công.
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
@@ -691,7 +729,7 @@ pub async fn run_peer(
                             if is_relayed && !peer.relay_peers.contains(&peer_id) {
                                 println!(
                                     "{} {} - {}",
-                                    "🔄".bright_yellow(),
+                                    "[↻]".bright_yellow(),
                                     "Đang thử nâng cấp kết nối relayed lên direct (DCUtR)...".bright_yellow(),
                                     peer_id.to_string().bright_black()
                                 );
@@ -699,15 +737,46 @@ pub async fn run_peer(
                         }
 
                         // Kết nối bị đóng.
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                            if let Some(info) = peer.connected_peers.remove(&peer_id) {
+                        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                            if let Some(info) = peer.connected_peers.get(&peer_id) {
                                 let name = info.name.as_deref().unwrap_or("Unknown");
+                                let was_relayed = info.connection_type == ConnectionType::Relayed;
+                                
                                 println!(
-                                    "{} {} {}",
+                                    "{} {} {} {}",
                                     "←".bright_red(),
                                     name.bright_yellow(),
-                                    "đã rời phòng".bright_black()
+                                    "ngắt kết nối".bright_black(),
+                                    if let Some(err) = cause {
+                                        format!("({})", err).bright_black().to_string()
+                                    } else {
+                                        "".to_string()
+                                    }
                                 );
+                                
+                                // Nếu là kết nối relayed, thử reconnect qua relay
+                                if was_relayed && !peer.relay_peers.contains(&peer_id) {
+                                    if let Some(relay_addr) = info.addrs.iter()
+                                        .find(|addr| addr.to_string().contains("/p2p-circuit")) {
+                                        println!(
+                                            "    [↻] {}",
+                                            "Thử kết nối lại qua relay...".bright_cyan()
+                                        );
+                                        
+                                        if let Err(e) = peer.swarm.dial(relay_addr.clone()) {
+                                            println!(
+                                                "    [!] {} - {}",
+                                                "Không thể reconnect:".bright_yellow(),
+                                                e.to_string().bright_black()
+                                            );
+                                        }
+                                    }
+                                }
+                                
+                                // Chỉ xóa khỏi danh sách nếu không phải relay peer
+                                if !peer.relay_peers.contains(&peer_id) {
+                                    peer.connected_peers.remove(&peer_id);
+                                }
                             }
                         }
 
